@@ -1,26 +1,64 @@
 //! Shared daemon state: the store, the current connection state and the
 //! event fan-out to every connected client.
 
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
-use tokio::sync::broadcast;
+use tokio::sync::{Semaphore, broadcast};
 use whatkroft_ipc::{ConnState, Event, Message, MessageStatus};
 
 use crate::store::{NewMessage, Store};
 
+/// Attachments fetched at the same time, across all clients.
+const PARALLEL_DOWNLOADS: usize = 4;
+
 pub struct Hub {
     pub store: Store,
+    /// Where downloaded and sent attachments are kept.
+    pub media_dir: PathBuf,
+    /// Limits concurrent attachment downloads.
+    pub download_slots: Semaphore,
+    /// (chat, message id) of downloads in flight, so a second request for
+    /// the same attachment does not fetch it twice.
+    downloading: Mutex<HashSet<(String, String)>>,
     state: Mutex<ConnState>,
     events: broadcast::Sender<Event>,
 }
 
 impl Hub {
-    pub fn new(store: Store) -> Self {
+    pub fn new(store: Store, media_dir: PathBuf) -> Self {
         let (events, _) = broadcast::channel(1024);
         Self {
             store,
+            media_dir,
+            download_slots: Semaphore::new(PARALLEL_DOWNLOADS),
+            downloading: Mutex::new(HashSet::new()),
             state: Mutex::new(ConnState::Starting),
             events,
+        }
+    }
+
+    /// Claim a download. `false` means it is already under way.
+    pub fn begin_download(&self, chat: &str, id: &str) -> bool {
+        self.downloading
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((chat.to_owned(), id.to_owned()))
+    }
+
+    pub fn end_download(&self, chat: &str, id: &str) {
+        self.downloading
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(chat.to_owned(), id.to_owned()));
+    }
+
+    pub fn set_archived(&self, chat: &str, archived: bool) {
+        match self.store.set_archived(chat, archived) {
+            Ok(true) => self.emit_chat(chat),
+            Ok(false) => {}
+            Err(e) => log::error!("archiving {chat}: {e}"),
         }
     }
 

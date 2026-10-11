@@ -6,6 +6,7 @@
 mod client;
 mod qr;
 mod ui;
+mod widgets;
 
 use adw::prelude::*;
 use gtk::glib;

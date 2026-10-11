@@ -1,21 +1,22 @@
 //! The main window: pairing screen, chat list and conversation view.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
 use adw::prelude::*;
-use gtk::{gio, glib, pango};
-use whatkroft_ipc::{
-    Chat, ConnState, Event, Message, MessageKind, MessageStatus, Reply, Request, ServerMessage,
-};
+use gtk::{gdk, gio, glib, pango};
+use whatkroft_ipc::{Chat, ConnState, Event, Message, MessageKind, Reply, Request, ServerMessage};
 
 use crate::client::{self, Conn};
 use crate::qr::QrView;
+use crate::widgets::{self, ARCHIVE_ROW, MediaState};
 
-/// Messages loaded when a chat is opened.
-const PAGE_SIZE: u32 = 200;
+/// Messages loaded when a chat is opened, and per step when scrolling back.
+const PAGE_SIZE: u32 = 100;
+/// Distance from the top (in pixels) at which earlier messages are fetched.
+const LOAD_OLDER_WITHIN: f64 = 400.0;
 /// How close to the end (in pixels) still counts as "reading the latest".
 const BOTTOM_SLACK: f64 = 48.0;
 
@@ -42,7 +43,16 @@ pub struct App {
     banner: adw::Banner,
     split: adw::NavigationSplitView,
     chat_list: gtk::ListBox,
+    sidebar_page: adw::NavigationPage,
+    /// Leaves the archive; only shown while it is open.
+    back_button: gtk::Button,
     content_page: adw::NavigationPage,
+    /// Context menu for chat rows. One popover for the whole list, owned by
+    /// a widget that outlives the rows, which are rebuilt on every change.
+    row_menu: gtk::PopoverMenu,
+    /// Per-chat menu in the conversation header.
+    chat_menu: gio::Menu,
+    chat_menu_button: gtk::MenuButton,
     /// Right-hand side: "empty" until a chat is opened, then "chat".
     content: gtk::Stack,
     messages: gtk::Box,
@@ -51,17 +61,42 @@ pub struct App {
     state: RefCell<State>,
 }
 
+/// The widgets of one message on screen.
+struct Row {
+    bubble: gtk::Box,
+    meta: gtk::Label,
+    /// Clock time shown under the bubble, kept to rebuild the status line.
+    time: String,
+}
+
 #[derive(Default)]
 struct State {
     conn: Option<Rc<Conn>>,
     chats: Vec<Chat>,
     current: Option<String>,
-    /// Status line of each of our own messages on screen, with its time text.
-    meta: HashMap<String, (gtk::Label, String)>,
+    /// The sidebar lists archived chats instead of the main list.
+    showing_archived: bool,
+    /// Messages of the open chat, oldest first.
+    loaded: Vec<Message>,
+    rows: HashMap<String, Row>,
     /// (year, day of year) of the last message drawn, for day separators.
     last_day: Option<(i32, i32)>,
     /// Keep the view pinned to the newest message as more arrive.
     stick_to_bottom: bool,
+    /// Earlier messages may exist beyond the oldest one loaded.
+    has_more: bool,
+    loading_older: bool,
+    /// Distance from the end to restore after earlier messages are inserted
+    /// above, so the text being read does not jump.
+    anchor_from_end: Option<f64>,
+    /// Attachments being fetched, by message id.
+    downloading: HashSet<String>,
+    /// Attachments whose last fetch failed; not retried automatically.
+    failed: HashSet<String>,
+    /// Attachments the user asked to open, to act on once they arrive.
+    open_when_ready: HashSet<String>,
+    /// The voice note or audio file being played, by message id.
+    player: Option<(String, gtk::MediaFile)>,
     /// The daemon process, if this window had to start one.
     daemon: Option<std::process::Child>,
 }
@@ -144,7 +179,14 @@ impl App {
             .tooltip_text("Main Menu")
             .primary(true)
             .build();
+        let back_button = gtk::Button::builder()
+            .icon_name("go-previous-symbolic")
+            .tooltip_text("Back to chats")
+            .action_name("win.show-chats")
+            .visible(false)
+            .build();
         let sidebar_header = adw::HeaderBar::new();
+        sidebar_header.pack_start(&back_button);
         sidebar_header.pack_end(&menu_button);
 
         let sidebar_view = adw::ToolbarView::new();
@@ -176,6 +218,13 @@ impl App {
             .placeholder_text("Message")
             .hexpand(true)
             .build();
+        let attach = gtk::Button::builder()
+            .icon_name("mail-attachment-symbolic")
+            .tooltip_text("Send a file")
+            .action_name("win.attach")
+            .build();
+        attach.add_css_class("flat");
+        attach.add_css_class("circular");
         let send = gtk::Button::builder()
             .icon_name("document-send-symbolic")
             .tooltip_text("Send")
@@ -185,6 +234,7 @@ impl App {
         send.add_css_class("circular");
         let composer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         composer.add_css_class("composer");
+        composer.append(&attach);
         composer.append(&entry);
         composer.append(&send);
 
@@ -208,8 +258,17 @@ impl App {
         content.add_named(&empty, Some("empty"));
         content.add_named(&chat_view, Some("chat"));
 
+        let chat_menu = gio::Menu::new();
+        let chat_menu_button = gtk::MenuButton::builder()
+            .icon_name("view-more-symbolic")
+            .menu_model(&chat_menu)
+            .tooltip_text("Chat Menu")
+            .visible(false)
+            .build();
+        let content_header = adw::HeaderBar::new();
+        content_header.pack_end(&chat_menu_button);
         let content_view = adw::ToolbarView::new();
-        content_view.add_top_bar(&adw::HeaderBar::new());
+        content_view.add_top_bar(&content_header);
         content_view.set_content(Some(&content));
         let content_page = adw::NavigationPage::new(&content_view, "WhatKroft");
 
@@ -219,6 +278,11 @@ impl App {
         split.set_sidebar(Some(&sidebar_page));
         split.set_content(Some(&content_page));
         split.set_vexpand(true);
+
+        let row_menu = gtk::PopoverMenu::from_model(None::<&gio::Menu>);
+        row_menu.set_parent(&split);
+        row_menu.set_has_arrow(false);
+        row_menu.set_halign(gtk::Align::Start);
 
         let banner = adw::Banner::new("");
         let main_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -264,7 +328,12 @@ impl App {
             banner,
             split,
             chat_list,
+            sidebar_page,
+            back_button,
             content_page,
+            row_menu,
+            chat_menu,
+            chat_menu_button,
             content,
             messages,
             scroller,
@@ -279,23 +348,49 @@ impl App {
     fn connect_signals(self: &Rc<Self>) {
         let this = Rc::clone(self);
         self.chat_list.connect_row_activated(move |_, row| {
-            let jid = row.widget_name().to_string();
-            this.open_chat(&jid);
+            let name = row.widget_name();
+            if name == ARCHIVE_ROW {
+                this.show_archive(true);
+            } else {
+                this.open_chat(&name);
+            }
         });
+
+        // Right-click on a chat offers to archive it.
+        let this = Rc::clone(self);
+        let secondary = gtk::GestureClick::builder()
+            .button(gdk::BUTTON_SECONDARY)
+            .build();
+        secondary.connect_pressed(move |gesture, _, x, y| {
+            if let Some(row) = this.chat_list.row_at_y(y as i32) {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                this.show_row_menu(&row, x, y);
+            }
+        });
+        self.chat_list.add_controller(secondary);
 
         let this = Rc::clone(self);
         self.entry.connect_activate(move |_| this.send_current());
 
-        // Follow new messages only while the reader is at the end.
         let adjustment = self.scroller.vadjustment();
         let this = Rc::clone(self);
         adjustment.connect_value_changed(move |adj| {
+            // Follow new messages only while the reader is at the end.
             let at_end = adj.value() + adj.page_size() >= adj.upper() - BOTTOM_SLACK;
             this.state.borrow_mut().stick_to_bottom = at_end;
+            if !at_end && adj.value() < LOAD_OLDER_WITHIN {
+                this.load_older();
+            }
         });
         let this = Rc::clone(self);
         adjustment.connect_upper_notify(move |adj| {
-            if this.state.borrow().stick_to_bottom {
+            let (stick, anchor) = {
+                let state = this.state.borrow();
+                (state.stick_to_bottom, state.anchor_from_end)
+            };
+            if let Some(anchor) = anchor {
+                adj.set_value(adj.upper() - anchor);
+            } else if stick {
                 adj.set_value(adj.upper() - adj.page_size());
             }
         });
@@ -307,23 +402,51 @@ impl App {
                 this.mark_current_read();
             }
         });
+
+        // Dropping files on the conversation sends them.
+        let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+        let this = Rc::clone(self);
+        drop.connect_drop(move |_, value, _, _| {
+            let Ok(files) = value.get::<gdk::FileList>() else {
+                return false;
+            };
+            for file in files.files() {
+                if let Some(path) = file.path() {
+                    this.send_file(&path);
+                }
+            }
+            true
+        });
+        self.scroller.add_controller(drop);
     }
 
     fn install_actions(self: &Rc<Self>) {
-        let send = gio::SimpleAction::new("send", None);
-        let this = Rc::clone(self);
-        send.connect_activate(move |_, _| this.send_current());
-        self.window.add_action(&send);
+        let simple = |name: &str, run: fn(&Rc<Self>)| {
+            let action = gio::SimpleAction::new(name, None);
+            let this = Rc::clone(self);
+            action.connect_activate(move |_, _| run(&this));
+            self.window.add_action(&action);
+        };
+        simple("send", |this| this.send_current());
+        simple("attach", |this| this.choose_file());
+        simple("unlink", |this| this.confirm_unlink());
+        simple("about", |this| this.show_about());
+        simple("show-chats", |this| this.show_archive(false));
 
-        let unlink = gio::SimpleAction::new("unlink", None);
-        let this = Rc::clone(self);
-        unlink.connect_activate(move |_, _| this.confirm_unlink());
-        self.window.add_action(&unlink);
-
-        let about = gio::SimpleAction::new("about", None);
-        let this = Rc::clone(self);
-        about.connect_activate(move |_, _| this.show_about());
-        self.window.add_action(&about);
+        // Archive or unarchive the chat whose JID is the parameter.
+        for (name, archived) in [("archive-chat", true), ("unarchive-chat", false)] {
+            let action = gio::SimpleAction::new(name, Some(glib::VariantTy::STRING));
+            let this = Rc::clone(self);
+            action.connect_activate(move |_, parameter| {
+                if let Some(chat) = parameter.and_then(|p| p.str()) {
+                    this.request(Request::SetArchived {
+                        chat: chat.to_owned(),
+                        archived,
+                    });
+                }
+            });
+            self.window.add_action(&action);
+        }
     }
 
     // ── Daemon connection ──────────────────────────────────────────────
@@ -398,7 +521,7 @@ impl App {
         }
     }
 
-    fn handle(&self, message: ServerMessage) {
+    fn handle(self: &Rc<Self>, message: ServerMessage) {
         match message {
             ServerMessage::Event { event } => self.handle_event(event),
             ServerMessage::Reply {
@@ -411,7 +534,7 @@ impl App {
         }
     }
 
-    fn handle_event(&self, event: Event) {
+    fn handle_event(self: &Rc<Self>, event: Event) {
         match event {
             Event::State(state) => self.apply_state(state),
             Event::Chat(chat) => self.upsert_chat(chat),
@@ -421,24 +544,75 @@ impl App {
             }
             Event::Message(message) => self.on_message(message),
             Event::Status { chat, id, status } => {
-                if self.state.borrow().current.as_deref() == Some(chat.as_str())
-                    && let Some((label, time)) = self.state.borrow().meta.get(&id)
-                {
-                    set_meta(label, time, Some(status));
+                let mut state = self.state.borrow_mut();
+                if state.current.as_deref() != Some(chat.as_str()) {
+                    return;
+                }
+                if let Some(message) = state.loaded.iter_mut().find(|m| m.id == id) {
+                    message.status = status;
+                }
+                if let Some(row) = state.rows.get(&id) {
+                    widgets::set_meta(&row.meta, &row.time, Some(status));
+                }
+            }
+            Event::Media { chat, id, path } => {
+                let open = {
+                    let mut state = self.state.borrow_mut();
+                    state.downloading.remove(&id);
+                    state.failed.remove(&id);
+                    if state.current.as_deref() != Some(chat.as_str()) {
+                        return;
+                    }
+                    if let Some(media) = state
+                        .loaded
+                        .iter_mut()
+                        .find(|m| m.id == id)
+                        .and_then(|m| m.media.as_mut())
+                    {
+                        media.path = Some(path);
+                    }
+                    state.open_when_ready.remove(&id)
+                };
+                self.refresh_bubble(&id);
+                if open {
+                    self.open_media(&id);
+                }
+            }
+            Event::MediaFailed { chat, id, error } => {
+                let asked = {
+                    let mut state = self.state.borrow_mut();
+                    state.downloading.remove(&id);
+                    state.failed.insert(id.clone());
+                    state.open_when_ready.remove(&id)
+                        && state.current.as_deref() == Some(chat.as_str())
+                };
+                self.refresh_bubble(&id);
+                // Only interrupt for something the user clicked; a photo that
+                // failed to load in the background just shows as failed.
+                if asked {
+                    self.toasts.add_toast(adw::Toast::new(&error));
                 }
             }
         }
     }
 
-    fn handle_reply(&self, reply: Reply) {
+    fn handle_reply(self: &Rc<Self>, reply: Reply) {
         match reply {
             Reply::Chats(chats) => {
                 self.state.borrow_mut().chats = chats;
                 self.rebuild_chat_list();
             }
-            Reply::Messages { chat, messages } => {
-                if self.state.borrow().current.as_deref() == Some(chat.as_str()) {
-                    self.show_messages(&messages);
+            Reply::Messages {
+                chat,
+                before_id,
+                messages,
+            } => {
+                if self.state.borrow().current.as_deref() != Some(chat.as_str()) {
+                    return;
+                }
+                match before_id {
+                    None => self.show_messages(messages),
+                    Some(_) => self.prepend_messages(messages),
                 }
             }
             Reply::State(state) => self.apply_state(state),
@@ -514,30 +688,95 @@ impl App {
             self.chat_list.remove(&row);
         }
         let state = self.state.borrow();
-        for chat in &state.chats {
-            let row = chat_row(chat);
+        let archived: Vec<&Chat> = state.chats.iter().filter(|c| c.archived).collect();
+        // An emptied archive has nothing to show: fall back to the chats.
+        let in_archive = state.showing_archived && !archived.is_empty();
+
+        self.back_button.set_visible(in_archive);
+        self.sidebar_page
+            .set_title(if in_archive { "Archived" } else { "WhatKroft" });
+
+        if !in_archive && !archived.is_empty() {
+            let unread = archived.iter().map(|c| c.unread).sum();
+            self.chat_list
+                .append(&widgets::archived_row(archived.len(), unread));
+        }
+        let mut selected = false;
+        for chat in state.chats.iter().filter(|c| c.archived == in_archive) {
+            let row = widgets::chat_row(chat);
             self.chat_list.append(&row);
             if state.current.as_deref() == Some(chat.jid.as_str()) {
                 self.chat_list.select_row(Some(&row));
-                self.content_page.set_title(&chat.name);
+                selected = true;
             }
+        }
+        if !selected {
+            self.chat_list.unselect_all();
+        }
+        if let Some(chat) = state
+            .current
+            .as_ref()
+            .and_then(|jid| state.chats.iter().find(|c| &c.jid == jid))
+        {
+            self.content_page.set_title(&chat.name);
+            self.update_chat_menu(chat);
         }
     }
 
-    fn open_chat(&self, jid: &str) {
-        let name = {
+    fn show_archive(&self, show: bool) {
+        self.state.borrow_mut().showing_archived = show;
+        self.rebuild_chat_list();
+    }
+
+    /// The conversation header's menu for the open chat.
+    fn update_chat_menu(&self, chat: &Chat) {
+        self.chat_menu.remove_all();
+        self.chat_menu.append_item(&archive_item(chat));
+        self.chat_menu_button.set_visible(true);
+    }
+
+    /// Pop up the context menu for `row` at (x, y) in chat list coordinates.
+    fn show_row_menu(&self, row: &gtk::ListBoxRow, x: f64, y: f64) {
+        let jid = row.widget_name();
+        let menu = gio::Menu::new();
+        {
+            let state = self.state.borrow();
+            let Some(chat) = state.chats.iter().find(|c| c.jid == jid.as_str()) else {
+                return;
+            };
+            menu.append_item(&archive_item(chat));
+        }
+        let Some(point) = self
+            .chat_list
+            .compute_point(&self.split, &gtk::graphene::Point::new(x as f32, y as f32))
+        else {
+            return;
+        };
+        self.row_menu.set_menu_model(Some(&menu));
+        self.row_menu.set_pointing_to(Some(&gdk::Rectangle::new(
+            point.x() as i32,
+            point.y() as i32,
+            1,
+            1,
+        )));
+        self.row_menu.popup();
+    }
+
+    fn open_chat(self: &Rc<Self>, jid: &str) {
+        let chat = {
             let mut state = self.state.borrow_mut();
             state.current = Some(jid.to_owned());
-            state.stick_to_bottom = true;
-            state
-                .chats
-                .iter()
-                .find(|c| c.jid == jid)
-                .map(|c| c.name.clone())
+            state.chats.iter().find(|c| c.jid == jid).cloned()
         };
-        self.content_page
-            .set_title(name.as_deref().unwrap_or("Chat"));
-        self.show_messages(&[]);
+        self.stop_player();
+        match &chat {
+            Some(chat) => {
+                self.content_page.set_title(&chat.name);
+                self.update_chat_menu(chat);
+            }
+            None => self.content_page.set_title("Chat"),
+        }
+        self.show_messages(Vec::new());
         self.content.set_visible_child_name("chat");
         self.split.set_show_content(true);
         self.reload_current();
@@ -552,7 +791,7 @@ impl App {
         if let Some(chat) = current {
             self.request(Request::ListMessages {
                 chat,
-                before: None,
+                before_id: None,
                 limit: PAGE_SIZE,
             });
         }
@@ -576,59 +815,124 @@ impl App {
 
     // ── Conversation ───────────────────────────────────────────────────
 
-    fn show_messages(&self, messages: &[Message]) {
+    /// Fetch the page before the oldest message on screen.
+    fn load_older(&self) {
+        let request = {
+            let mut state = self.state.borrow_mut();
+            if !state.has_more || state.loading_older {
+                return;
+            }
+            let (Some(chat), Some(oldest)) = (state.current.clone(), state.loaded.first()) else {
+                return;
+            };
+            let before_id = Some(oldest.id.clone());
+            state.loading_older = true;
+            Request::ListMessages {
+                chat,
+                before_id,
+                limit: PAGE_SIZE,
+            }
+        };
+        self.request(request);
+    }
+
+    /// Replace the conversation with the newest page of messages.
+    fn show_messages(self: &Rc<Self>, messages: Vec<Message>) {
+        {
+            let mut state = self.state.borrow_mut();
+            state.has_more = messages.len() as u32 >= PAGE_SIZE;
+            state.loading_older = false;
+            state.anchor_from_end = None;
+            state.stick_to_bottom = true;
+            state.loaded = messages;
+        }
+        self.render_all();
+    }
+
+    /// Insert an earlier page above what is shown, keeping the reader's place.
+    fn prepend_messages(self: &Rc<Self>, mut older: Vec<Message>) {
+        let adjustment = self.scroller.vadjustment();
+        {
+            let mut state = self.state.borrow_mut();
+            state.loading_older = false;
+            state.has_more = older.len() as u32 >= PAGE_SIZE;
+            let known: HashSet<&str> = state.loaded.iter().map(|m| m.id.as_str()).collect();
+            older.retain(|m| !known.contains(m.id.as_str()));
+            if older.is_empty() {
+                return;
+            }
+            older.append(&mut state.loaded);
+            state.loaded = older;
+            state.stick_to_bottom = false;
+            state.anchor_from_end = Some(adjustment.upper() - adjustment.value());
+        }
+        self.render_all();
+        // Layout settles over a few frames; hold the anchor until it has.
+        let this = Rc::clone(self);
+        glib::timeout_add_local_once(Duration::from_millis(400), move || {
+            this.state.borrow_mut().anchor_from_end = None;
+        });
+    }
+
+    fn render_all(self: &Rc<Self>) {
         while let Some(child) = self.messages.first_child() {
             self.messages.remove(&child);
         }
-        {
+        let messages = {
             let mut state = self.state.borrow_mut();
-            state.meta.clear();
+            state.rows.clear();
             state.last_day = None;
-            state.stick_to_bottom = true;
+            state.loaded.clone()
+        };
+        if self.state.borrow().has_more {
+            let hint = gtk::Label::new(Some("Scroll up for earlier messages"));
+            hint.add_css_class("loading-older");
+            self.messages.append(&hint);
         }
-        for message in messages {
-            self.append_message(message);
+        for message in &messages {
+            self.append_row(message);
         }
     }
 
-    fn on_message(&self, message: Message) {
+    fn on_message(self: &Rc<Self>, message: Message) {
         let is_current = self.state.borrow().current.as_deref() == Some(message.chat.as_str());
         if is_current {
-            // Sending always jumps to the end; reading back does not get
-            // interrupted by incoming messages.
-            if message.from_me {
-                self.state.borrow_mut().stick_to_bottom = true;
+            let fresh = {
+                let mut state = self.state.borrow_mut();
+                // Sending always jumps to the end; reading back does not get
+                // interrupted by incoming messages.
+                if message.from_me {
+                    state.stick_to_bottom = true;
+                    state.anchor_from_end = None;
+                }
+                let fresh = !state.loaded.iter().any(|m| m.id == message.id);
+                if fresh {
+                    state.loaded.push(message.clone());
+                }
+                fresh
+            };
+            if fresh {
+                self.append_row(&message);
             }
-            self.append_message(&message);
         }
         if !message.from_me && !(is_current && self.window.is_active()) {
             self.notify(&message);
         }
     }
 
-    fn append_message(&self, message: &Message) {
-        if self.state.borrow().meta.contains_key(&message.id) {
-            return;
-        }
+    /// Add one message at the end of the conversation.
+    fn append_row(self: &Rc<Self>, message: &Message) {
         let when = glib::DateTime::from_unix_local(message.timestamp).ok();
         if let Some(when) = &when {
             let day = (when.year(), when.day_of_year());
             if self.state.borrow().last_day != Some(day) {
                 self.state.borrow_mut().last_day = Some(day);
-                let label = gtk::Label::new(Some(&day_label(when)));
+                let label = gtk::Label::new(Some(&widgets::day_label(when)));
                 label.add_css_class("day");
                 label.set_halign(gtk::Align::Center);
                 self.messages.append(&label);
             }
         }
-
-        let in_group = {
-            let state = self.state.borrow();
-            state
-                .chats
-                .iter()
-                .any(|c| c.jid == message.chat && c.is_group)
-        };
 
         let bubble = gtk::Box::new(gtk::Orientation::Vertical, 2);
         bubble.add_css_class("bubble");
@@ -638,6 +942,86 @@ impl App {
         } else {
             gtk::Align::Start
         });
+        let meta = gtk::Label::new(None);
+        meta.add_css_class("meta");
+        meta.set_halign(gtk::Align::End);
+        let time = when
+            .and_then(|w| w.format("%H:%M").ok())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        self.messages.append(&bubble);
+        self.state
+            .borrow_mut()
+            .rows
+            .insert(message.id.clone(), Row { bubble, meta, time });
+        self.fill_bubble(message);
+    }
+
+    /// Rebuild one message's bubble after its attachment changed state.
+    fn refresh_bubble(self: &Rc<Self>, id: &str) {
+        let message = self
+            .state
+            .borrow()
+            .loaded
+            .iter()
+            .find(|m| m.id == id)
+            .cloned();
+        let Some(message) = message else { return };
+        // Rebuilding a bubble that holds the keyboard focus would hand the
+        // focus to its first label, which selects all its text.
+        let had_focus = self
+            .state
+            .borrow()
+            .rows
+            .get(id)
+            .is_some_and(|row| row.bubble.focus_child().is_some());
+        self.fill_bubble(&message);
+        if had_focus {
+            self.entry.grab_focus_without_selecting();
+        }
+    }
+
+    fn media_state(&self, message: &Message) -> MediaState {
+        let state = self.state.borrow();
+        if state.downloading.contains(&message.id) {
+            MediaState::Downloading
+        } else if state.failed.contains(&message.id) {
+            MediaState::Failed
+        } else if state
+            .player
+            .as_ref()
+            .is_some_and(|(id, player)| id == &message.id && player.is_playing())
+        {
+            MediaState::Playing
+        } else {
+            MediaState::Idle
+        }
+    }
+
+    fn fill_bubble(self: &Rc<Self>, message: &Message) {
+        let (bubble, meta, time, in_group) = {
+            let state = self.state.borrow();
+            let Some(row) = state.rows.get(&message.id) else {
+                return;
+            };
+            let in_group = state
+                .chats
+                .iter()
+                .any(|c| c.jid == message.chat && c.is_group);
+            (
+                row.bubble.clone(),
+                row.meta.clone(),
+                row.time.clone(),
+                in_group,
+            )
+        };
+        while let Some(child) = bubble.first_child() {
+            bubble.remove(&child);
+        }
+        if message.kind == MessageKind::Sticker {
+            bubble.add_css_class("sticker");
+        }
 
         if in_group
             && !message.from_me
@@ -650,33 +1034,198 @@ impl App {
             bubble.append(&sender);
         }
 
-        let body = gtk::Label::new(Some(&message.text));
-        body.set_wrap(true);
-        body.set_wrap_mode(pango::WrapMode::WordChar);
-        body.set_xalign(0.0);
-        body.set_max_width_chars(52);
-        body.set_selectable(true);
-        if message.kind != MessageKind::Text {
-            body.add_css_class("media");
+        if let Some(media) = &message.media {
+            // Photos and stickers load by themselves; larger kinds wait for
+            // a click.
+            let auto = matches!(message.kind, MessageKind::Image | MessageKind::Sticker);
+            if auto && media.path.is_none() && self.media_state(message) == MediaState::Idle {
+                self.start_download(message, false);
+            }
+            let state = self.media_state(message);
+            match message.kind {
+                MessageKind::Image | MessageKind::Sticker | MessageKind::Video => {
+                    let picture = widgets::picture(message.kind, media, state);
+                    let click = gtk::GestureClick::new();
+                    let (this, id) = (Rc::clone(self), message.id.clone());
+                    click.connect_released(move |_, _, _, _| this.activate_media_later(&id));
+                    picture.add_controller(click);
+                    picture.set_cursor_from_name(Some("pointer"));
+                    bubble.append(&picture);
+                }
+                _ => {
+                    let (row, button) = widgets::attachment(message.kind, media, state);
+                    let (this, id) = (Rc::clone(self), message.id.clone());
+                    button.connect_clicked(move |_| this.activate_media_later(&id));
+                    bubble.append(&row);
+                }
+            }
         }
-        bubble.append(&body);
 
-        let time = when
-            .and_then(|w| w.format("%H:%M").ok())
-            .map(|s| s.to_string())
-            .unwrap_or_default();
-        let meta = gtk::Label::new(None);
-        meta.add_css_class("meta");
-        meta.set_halign(gtk::Align::End);
-        set_meta(&meta, &time, message.from_me.then_some(message.status));
+        if !message.text.is_empty() {
+            let body = gtk::Label::new(Some(&message.text));
+            body.set_wrap(true);
+            body.set_wrap_mode(pango::WrapMode::WordChar);
+            body.set_xalign(0.0);
+            body.set_max_width_chars(52);
+            body.set_selectable(true);
+            if message.media.is_none() && message.kind != MessageKind::Text {
+                body.add_css_class("described");
+            }
+            bubble.append(&body);
+        }
+
+        widgets::set_meta(&meta, &time, message.from_me.then_some(message.status));
         bubble.append(&meta);
-
-        self.messages.append(&bubble);
-        self.state
-            .borrow_mut()
-            .meta
-            .insert(message.id.clone(), (meta, time));
     }
+
+    // ── Attachments ────────────────────────────────────────────────────
+
+    fn start_download(&self, message: &Message, open_after: bool) {
+        {
+            let mut state = self.state.borrow_mut();
+            state.failed.remove(&message.id);
+            if open_after {
+                state.open_when_ready.insert(message.id.clone());
+            }
+            if !state.downloading.insert(message.id.clone()) {
+                return;
+            }
+        }
+        self.request(Request::DownloadMedia {
+            chat: message.chat.clone(),
+            id: message.id.clone(),
+        });
+    }
+
+    /// Acting on a click rebuilds the bubble, which destroys the widget that
+    /// was clicked; do it once the click has finished being delivered.
+    fn activate_media_later(self: &Rc<Self>, id: &str) {
+        let (this, id) = (Rc::clone(self), id.to_owned());
+        glib::idle_add_local_once(move || this.activate_media(&id));
+    }
+
+    /// The user clicked an attachment: open it, fetching it first if needed.
+    fn activate_media(self: &Rc<Self>, id: &str) {
+        let message = self
+            .state
+            .borrow()
+            .loaded
+            .iter()
+            .find(|m| m.id == id)
+            .cloned();
+        let Some(message) = message else { return };
+        let on_disk = message
+            .media
+            .as_ref()
+            .and_then(|m| m.path.as_deref())
+            .is_some_and(|path| std::path::Path::new(path).is_file());
+        if on_disk {
+            self.open_media(id);
+        } else {
+            self.start_download(&message, true);
+            self.refresh_bubble(id);
+        }
+    }
+
+    fn open_media(self: &Rc<Self>, id: &str) {
+        let found = {
+            let state = self.state.borrow();
+            state.loaded.iter().find(|m| m.id == id).and_then(|m| {
+                let path = m.media.as_ref()?.path.clone()?;
+                Some((m.kind, path))
+            })
+        };
+        let Some((kind, path)) = found else { return };
+        if kind == MessageKind::Audio {
+            self.toggle_playback(id, &path);
+        } else {
+            self.open_externally(&path);
+        }
+    }
+
+    /// Hand a file to the desktop's default application for its type.
+    fn open_externally(&self, path: &str) {
+        let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(path)));
+        let toasts = self.toasts.clone();
+        launcher.launch(Some(&self.window), gio::Cancellable::NONE, move |result| {
+            if let Err(e) = result {
+                log::warn!("opening attachment: {e}");
+                toasts.add_toast(adw::Toast::new("No application could open this file"));
+            }
+        });
+    }
+
+    fn stop_player(self: &Rc<Self>) {
+        let previous = self.state.borrow_mut().player.take();
+        if let Some((id, player)) = previous {
+            player.pause();
+            self.refresh_bubble(&id);
+        }
+    }
+
+    /// Play or pause a voice note in place. If GTK has no way to play the
+    /// format here, fall back to the desktop's audio player.
+    fn toggle_playback(self: &Rc<Self>, id: &str, path: &str) {
+        let current = self.state.borrow().player.clone();
+        if let Some((playing_id, player)) = current
+            && playing_id == id
+        {
+            if player.is_playing() {
+                player.pause();
+            } else {
+                player.play();
+            }
+            self.refresh_bubble(id);
+            return;
+        }
+        self.stop_player();
+
+        let player = gtk::MediaFile::for_filename(path);
+        let (this, owned_id) = (Rc::clone(self), id.to_owned());
+        player.connect_playing_notify(move |_| this.refresh_bubble(&owned_id));
+        let (this, owned_id, owned_path) = (Rc::clone(self), id.to_owned(), path.to_owned());
+        player.connect_error_notify(move |player| {
+            if let Some(error) = player.error() {
+                log::warn!("in-app playback unavailable ({error}); opening externally");
+                let ours = this
+                    .state
+                    .borrow()
+                    .player
+                    .as_ref()
+                    .is_some_and(|(id, _)| id == &owned_id);
+                if ours {
+                    this.state.borrow_mut().player = None;
+                    this.refresh_bubble(&owned_id);
+                    this.open_externally(&owned_path);
+                }
+            }
+        });
+        player.play();
+        self.state.borrow_mut().player = Some((id.to_owned(), player.clone()));
+        self.refresh_bubble(id);
+
+        // Without a media backend GTK hands out a player that never starts
+        // and never reports an error. Give it a moment, then fall back.
+        let (this, owned_id, owned_path) = (Rc::clone(self), id.to_owned(), path.to_owned());
+        glib::timeout_add_local_once(Duration::from_millis(1500), move || {
+            let stuck = this
+                .state
+                .borrow()
+                .player
+                .as_ref()
+                .is_some_and(|(id, current)| id == &owned_id && current == &player)
+                && !player.is_prepared()
+                && player.error().is_none();
+            if stuck {
+                log::warn!("no in-app audio playback available; opening externally");
+                this.state.borrow_mut().player = None;
+                this.refresh_bubble(&owned_id);
+                this.open_externally(&owned_path);
+            }
+        });
+    }
+
+    // ── Sending ────────────────────────────────────────────────────────
 
     fn send_current(&self) {
         let text = self.entry.text().trim().to_owned();
@@ -690,6 +1239,53 @@ impl App {
         self.entry.set_text("");
     }
 
+    fn choose_file(self: &Rc<Self>) {
+        if self.state.borrow().current.is_none() {
+            return;
+        }
+        let dialog = gtk::FileDialog::builder()
+            .title("Send a File")
+            .accept_label("Send")
+            .modal(true)
+            .build();
+        let this = Rc::clone(self);
+        dialog.open_multiple(Some(&self.window), gio::Cancellable::NONE, move |result| {
+            // Err here is the user closing the dialog.
+            let Ok(files) = result else { return };
+            for file in files.iter::<gio::File>().flatten() {
+                if let Some(path) = file.path() {
+                    this.send_file(&path);
+                }
+            }
+        });
+    }
+
+    /// Send a file to the open chat. Whatever is typed in the message box
+    /// goes along as the caption of the first file.
+    fn send_file(&self, path: &std::path::Path) {
+        let Some(chat) = self.state.borrow().current.clone() else {
+            return;
+        };
+        let Some(path_text) = path.to_str() else {
+            self.toasts
+                .add_toast(adw::Toast::new("That file name cannot be sent"));
+            return;
+        };
+        let caption = self.entry.text().trim().to_owned();
+        self.entry.set_text("");
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.toasts
+            .add_toast(adw::Toast::new(&format!("Sending {name}…")));
+        self.request(Request::SendFile {
+            chat,
+            path: path_text.to_owned(),
+            caption: (!caption.is_empty()).then_some(caption),
+        });
+    }
+
     fn notify(&self, message: &Message) {
         let chat_name = {
             let state = self.state.borrow();
@@ -699,11 +1295,12 @@ impl App {
                 .find(|c| c.jid == message.chat)
                 .map(|c| (c.name.clone(), c.is_group))
         };
+        let text = whatkroft_ipc::preview(message.kind, &message.text, message.media.as_ref());
         let sender = message.sender_name.as_deref().unwrap_or("New message");
         let (title, body) = match chat_name {
-            Some((name, true)) => (name, format!("{sender}: {}", message.text)),
-            Some((name, false)) => (name, message.text.clone()),
-            None => (sender.to_owned(), message.text.clone()),
+            Some((name, true)) => (name, format!("{sender}: {text}")),
+            Some((name, false)) => (name, text),
+            None => (sender.to_owned(), text),
         };
         let notification = gio::Notification::new(&title);
         notification.set_body(Some(&body));
@@ -753,111 +1350,14 @@ impl App {
     }
 }
 
-fn chat_row(chat: &Chat) -> gtk::ListBoxRow {
-    let avatar = adw::Avatar::new(40, Some(&chat.name), true);
-
-    let name = gtk::Label::new(Some(&chat.name));
-    name.add_css_class("name");
-    name.set_xalign(0.0);
-    name.set_hexpand(true);
-    name.set_ellipsize(pango::EllipsizeMode::End);
-
-    let time = gtk::Label::new(Some(&list_time(chat.last_timestamp)));
-    time.add_css_class("caption");
-    time.add_css_class("dim-label");
-
-    let top = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    top.append(&name);
-    top.append(&time);
-
-    // Previews are one line; a message with line breaks shows its first.
-    let preview_text = chat
-        .last_text
-        .as_deref()
-        .and_then(|t| t.lines().next())
-        .unwrap_or("");
-    let preview = gtk::Label::new(Some(preview_text));
-    preview.add_css_class("dim-label");
-    preview.set_xalign(0.0);
-    preview.set_hexpand(true);
-    preview.set_ellipsize(pango::EllipsizeMode::End);
-
-    let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    bottom.append(&preview);
-    if chat.unread > 0 {
-        let badge = gtk::Label::new(Some(&chat.unread.to_string()));
-        badge.add_css_class("badge");
-        badge.set_valign(gtk::Align::Center);
-        bottom.append(&badge);
-    }
-
-    let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    text.set_valign(gtk::Align::Center);
-    text.append(&top);
-    text.append(&bottom);
-
-    let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    content.add_css_class("chat-row");
-    content.append(&avatar);
-    content.append(&text);
-
-    let row = gtk::ListBoxRow::new();
-    row.set_widget_name(&chat.jid);
-    row.set_child(Some(&content));
-    row
-}
-
-/// Time and delivery state under a bubble. `status` is `None` for incoming
-/// messages, which show only the time.
-fn set_meta(label: &gtk::Label, time: &str, status: Option<MessageStatus>) {
-    let (mark, tooltip) = match status {
-        None => ("", None),
-        Some(MessageStatus::Pending) => (" ◷", Some("Sending")),
-        Some(MessageStatus::Sent) => (" ✓", Some("Sent")),
-        Some(MessageStatus::Delivered) => (" ✓✓", Some("Delivered")),
-        Some(MessageStatus::Read) => (" ✓✓", Some("Read")),
-    };
-    label.set_text(&format!("{time}{mark}"));
-    label.set_tooltip_text(tooltip);
-    if status == Some(MessageStatus::Read) {
-        label.add_css_class("read");
+/// Menu entry that archives `chat`, or takes it back out of the archive.
+fn archive_item(chat: &Chat) -> gio::MenuItem {
+    let (label, action) = if chat.archived {
+        ("Unarchive Chat", "win.unarchive-chat")
     } else {
-        label.remove_css_class("read");
-    }
-}
-
-fn same_day(a: &glib::DateTime, b: &glib::DateTime) -> bool {
-    a.year() == b.year() && a.day_of_year() == b.day_of_year()
-}
-
-/// Separator text between days in a conversation.
-fn day_label(when: &glib::DateTime) -> String {
-    if let Ok(now) = glib::DateTime::now_local() {
-        if same_day(when, &now) {
-            return "Today".to_owned();
-        }
-        if let Ok(yesterday) = now.add_days(-1)
-            && same_day(when, &yesterday)
-        {
-            return "Yesterday".to_owned();
-        }
-    }
-    when.format("%-e %B %Y")
-        .map(|s| s.to_string())
-        .unwrap_or_default()
-}
-
-/// Compact time for the chat list: the clock time today, the date before.
-fn list_time(timestamp: i64) -> String {
-    if timestamp <= 0 {
-        return String::new();
-    }
-    let Ok(when) = glib::DateTime::from_unix_local(timestamp) else {
-        return String::new();
+        ("Archive Chat", "win.archive-chat")
     };
-    let today = glib::DateTime::now_local().is_ok_and(|now| same_day(&when, &now));
-    let format = if today { "%H:%M" } else { "%-e %b" };
-    when.format(format)
-        .map(|s| s.to_string())
-        .unwrap_or_default()
+    let item = gio::MenuItem::new(Some(label), None);
+    item.set_action_and_target_value(Some(action), Some(&chat.jid.to_variant()));
+    item
 }

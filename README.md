@@ -15,15 +15,24 @@ spoken directly through [`whatsapp-rust`](https://github.com/oxidezap/whatsapp-r
 
 ## Status
 
-Early alpha. This is the first milestone: link a device, see your chats, read
-and send text.
+Early alpha. It links a device, shows your chats including archived ones,
+and reads and sends text and media.
 
 Working:
 
 - Linking as a companion device by QR code, with a persistent session
 - Chat list with names, previews, times and unread counts
-- Reading conversations (direct and group), with day separators
-- Sending text, with sent / delivered / read ticks
+- Archived chats: a separate Archived view, kept in step with your phone, and
+  archive or unarchive from a chat's right-click menu or its header menu
+- Reading conversations (direct and group), with day separators, loading
+  earlier messages as you scroll up
+- Photos and stickers shown in the conversation; videos, voice notes, audio
+  and documents downloaded on click and opened or played
+- Sending text, and sending files with the paperclip button or by dropping
+  them on the conversation. Photos go as photos (PNG and WebP are converted to
+  JPEG), MP4 as video, MP3/M4A/AAC/Ogg as audio, everything else as a document
+- Sent / delivered / read ticks
+- Read receipts when you open a chat, following your WhatsApp privacy setting
 - History import from the phone on first link
 - Local SQLite store, so the app opens instantly and reads offline
 - Desktop notifications for incoming messages while the window is open
@@ -32,18 +41,25 @@ Working:
 
 Not yet:
 
-- Media. Photos, videos, voice notes, documents, stickers, locations, contacts
-  and polls show as a short description (for example "Photo: caption"); they
-  cannot be viewed or sent
 - Replies, reactions, edits, deletions, mentions, link previews
-- Read receipts. Opening a chat clears the unread count locally but does not
-  tell the sender you have read it
+- Recording voice notes; sent audio goes as an audio file, not a voice note
+- Thumbnails for videos you send (the recipient sees a blank preview until
+  they play it), and video playback inside the window (videos open in your
+  video player)
+- Animated stickers (the first frame is shown) and sending stickers
+- Locations, contacts and polls show as a short description only
+- Attachments that have expired on WhatsApp's servers cannot be re-requested
+  from the phone yet
 - Typing indicators and presence
 - Voice and video calls
-- Search, archive, pin, mute, starred messages
+- Search, pin, mute, starred messages
 - Status updates and channels (hidden for now)
 - Notifications while the window is closed
-- Loading messages older than the newest 200 in a chat
+
+Voice notes play inside the window when GTK's media backend and the GStreamer
+plugins for the format are installed (on Arch: `gst-plugins-base` and
+`gst-plugins-good`); otherwise they open in your audio player. The AppImage
+does not bundle GStreamer, so there they open in your audio player.
 
 ## How it fits together
 
@@ -52,13 +68,14 @@ Not yet:
 │ whatkroft  │ ◄─────────────────────────► │ whatkroftd   │ ◄──────────► │ WhatsApp │
 │ GTK4 window│                             │ daemon       │   protocol   │ servers  │
 └────────────┘                             │ ├ session.db │              └──────────┘
-                                           │ └ chats.db   │
+                                           │ ├ chats.db   │
+                                           │ └ media/     │
                                            └──────────────┘
 ```
 
 | Crate | What it is |
 | --- | --- |
-| `crates/whatkroftd` | Background daemon. Owns the WhatsApp connection (`wa.rs`), the chat database (`store.rs`) and the socket server (`ipc.rs`). |
+| `crates/whatkroftd` | Background daemon. Owns the WhatsApp connection (`wa.rs`), attachments (`media.rs`), the chat database (`store.rs`) and the socket server (`ipc.rs`). |
 | `crates/whatkroft` | The GTK4 / libadwaita window. Talks only to the daemon. |
 | `crates/whatkroft-ipc` | The wire protocol both sides share. |
 
@@ -137,7 +154,7 @@ made-up account served from memory, then open the window:
 ```
 
 `--demo-pairing` stays on the pairing screen instead. Nothing is sent
-anywhere in either mode.
+anywhere in either mode, and the demo's attachments are generated on the spot.
 
 ## Where things are kept
 
@@ -145,6 +162,7 @@ anywhere in either mode.
 | --- | --- |
 | `$XDG_DATA_HOME/whatkroft/session.db` | WhatsApp session keys. Anyone who copies this file can act as your linked device. |
 | `$XDG_DATA_HOME/whatkroft/chats.db` | Your chats and messages, unencrypted. |
+| `$XDG_DATA_HOME/whatkroft/media/` | Attachments you have viewed or sent, unencrypted, one folder per chat. |
 | `$XDG_RUNTIME_DIR/whatkroft/daemon.sock` | Control socket. |
 
 `XDG_DATA_HOME` defaults to `~/.local/share`. Both directories are created

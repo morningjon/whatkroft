@@ -7,6 +7,7 @@
 mod demo;
 mod hub;
 mod ipc;
+mod media;
 mod store;
 mod summary;
 mod wa;
@@ -29,7 +30,7 @@ whatkroftd: WhatKroft background daemon
 Usage: whatkroftd [OPTIONS]
 
 Options:
-      --data-dir <DIR>  Where to keep the session and chat databases
+      --data-dir <DIR>  Where to keep the session, chats and attachments
                         [default: $XDG_DATA_HOME/whatkroft]
       --demo            Serve a made-up account from memory; no network
       --demo-pairing    Like --demo, but stay on the pairing screen
@@ -132,8 +133,12 @@ async fn main() -> anyhow::Result<()> {
     let listener = bind_socket(&socket)?;
     let (stop, stopping) = watch::channel(false);
 
+    let args_demo = args.demo;
+    let demo_media_dir =
+        std::env::temp_dir().join(format!("whatkroft-demo-{}", std::process::id()));
     let (hub, backend, session) = if args.demo {
-        let hub = Arc::new(Hub::new(Store::open_in_memory()?));
+        // Demo attachments are throwaway: keep them out of the real data.
+        let hub = Arc::new(Hub::new(Store::open_in_memory()?, demo_media_dir.clone()));
         demo::start(&hub, args.demo_pairing)?;
         log::info!("demo mode: serving a made-up account, nothing is sent anywhere");
         (hub, Backend::Demo, None)
@@ -144,7 +149,7 @@ async fn main() -> anyhow::Result<()> {
         };
         private_dir(&data_dir)?;
         let store = Store::open(&data_dir.join("chats.db")).context("opening chat database")?;
-        let hub = Arc::new(Hub::new(store));
+        let hub = Arc::new(Hub::new(store, data_dir.join("media")));
         let slot = Arc::new(wa::ClientSlot::default());
         let session = tokio::spawn(wa::run(
             Arc::clone(&hub),
@@ -180,5 +185,8 @@ async fn main() -> anyhow::Result<()> {
 
     let _ = server.await;
     let _ = std::fs::remove_file(&socket);
+    if args_demo {
+        let _ = std::fs::remove_dir_all(&demo_media_dir);
+    }
     outcome
 }

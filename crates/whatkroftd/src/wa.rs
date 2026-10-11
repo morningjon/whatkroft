@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use tokio::sync::{mpsc, oneshot, watch};
-use whatkroft_ipc::{ConnState, Event as IpcEvent, Message, MessageKind, MessageStatus};
+use whatkroft_ipc::{ConnState, Event as IpcEvent, Message, MessageStatus};
 use whatsapp_rust::buffa::Enumeration;
 use whatsapp_rust::prelude::*;
 use whatsapp_rust::types::events::LazyHistorySync;
@@ -16,7 +16,7 @@ use whatsapp_rust::wacore_binary::JidExt;
 
 use crate::hub::Hub;
 use crate::store::NewMessage;
-use crate::summary::summarise;
+use crate::summary::{Summary, summarise};
 
 /// Name shown under Linked Devices on the phone.
 const DEVICE_NAME: &str = "WhatKroft";
@@ -174,6 +174,10 @@ async fn handle(hub: &Hub, client: &Client, event: &Event) {
             }
         }
         Event::HistorySync(history) => on_history(hub, client, history).await,
+        Event::ArchiveUpdate(update) => {
+            let chat = canonical(client, &update.jid).await;
+            hub.set_archived(&chat, update.action.archived.unwrap_or(false));
+        }
         Event::PushNameUpdate(update) => {
             let jid = canonical(client, &update.jid).await;
             save_contact(hub, &jid, None, Some(&update.new_push_name));
@@ -251,7 +255,7 @@ async fn on_message(hub: &Hub, client: &Client, inbound: &InboundMessage) {
     if is_hidden(&source.chat) {
         return;
     }
-    let Some((kind, text)) = summarise(&inbound.message) else {
+    let Some(summary) = summarise(&inbound.message) else {
         return;
     };
     let chat = canonical(client, &source.chat).await;
@@ -273,13 +277,17 @@ async fn on_message(hub: &Hub, client: &Client, inbound: &InboundMessage) {
         sender,
         from_me: source.is_from_me,
         timestamp: info.timestamp.timestamp(),
-        kind,
-        text,
+        kind: summary.kind,
+        text: summary.text,
         status: if source.is_from_me {
             MessageStatus::Sent
         } else {
             MessageStatus::Delivered
         },
+        media: summary.media,
+        thumbnail: summary.thumbnail,
+        media_path: None,
+        needs_receipt: true,
     };
     if let Err(e) = hub.ingest(&message, true) {
         log::error!("storing message {}: {e}", message.id);
@@ -298,21 +306,78 @@ pub async fn send_text(
         .send_message(to, wa::Message::text(text))
         .await
         .map_err(|e| e.to_string())?;
-    let message = NewMessage {
-        chat: chat.to_owned(),
-        id: sent.message_id,
-        sender: String::new(),
-        from_me: true,
-        timestamp: now(),
-        kind: MessageKind::Text,
-        text: text.to_owned(),
-        status: MessageStatus::Sent,
-    };
+    let message = NewMessage::text(chat, &sent.message_id, "", true, now(), text);
     hub.ingest(&message, false).map_err(|e| e.to_string())?;
     hub.store
         .get_message(&message.chat, &message.id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "sent message missing from the store".to_owned())
+}
+
+/// Archive or unarchive a chat on the account, then locally.
+pub async fn set_archived(
+    hub: &Hub,
+    client: &Client,
+    chat: &str,
+    archived: bool,
+) -> Result<(), String> {
+    let jid: Jid = chat.parse().map_err(|e| format!("invalid chat id: {e}"))?;
+    let actions = client.chat_actions();
+    let result = if archived {
+        actions.archive_chat(&jid, None).await
+    } else {
+        actions.unarchive_chat(&jid, None).await
+    };
+    result.map_err(|e| e.to_string())?;
+    hub.set_archived(chat, archived);
+    Ok(())
+}
+
+/// Send the read receipts a chat owes. In a group each author is told
+/// separately; in a direct chat the receipt goes to the chat itself.
+pub async fn send_read_receipts(hub: &Hub, client: &Client, chat: &str) {
+    let owed = match hub.store.take_owed_receipts(chat) {
+        Ok(owed) if !owed.is_empty() => owed,
+        Ok(_) => return,
+        Err(e) => {
+            log::error!("reading owed receipts for {chat}: {e}");
+            return;
+        }
+    };
+    let Ok(chat_jid) = chat.parse::<Jid>() else {
+        return;
+    };
+    let is_group = chat_jid.is_group();
+    let mut by_sender: Vec<(String, Vec<&str>)> = Vec::new();
+    for receipt in &owed {
+        let key = if is_group {
+            receipt.sender.as_str()
+        } else {
+            ""
+        };
+        match by_sender.iter_mut().find(|(sender, _)| sender == key) {
+            Some((_, ids)) => ids.push(&receipt.id),
+            None => by_sender.push((key.to_owned(), vec![&receipt.id])),
+        }
+    }
+    for (sender, ids) in by_sender {
+        let sender_jid = if is_group {
+            match sender.parse::<Jid>() {
+                Ok(jid) => Some(jid),
+                Err(_) => continue,
+            }
+        } else {
+            None
+        };
+        if let Err(e) = client
+            .mark_as_read(&chat_jid, sender_jid.as_ref(), &ids)
+            .await
+        {
+            // Not retried: the chat is already read locally, and a missing
+            // receipt only leaves the sender's ticks grey.
+            log::warn!("sending read receipts to {chat}: {e}");
+        }
+    }
 }
 
 pub fn now() -> i64 {
@@ -328,6 +393,7 @@ struct HistoryChat {
     jid: String,
     name: Option<String>,
     unread: u32,
+    archived: bool,
     messages: Vec<HistoryMessage>,
 }
 
@@ -338,8 +404,7 @@ struct HistoryMessage {
     participant: Option<String>,
     push_name: Option<String>,
     timestamp: i64,
-    kind: MessageKind,
-    text: String,
+    summary: Summary,
     status: MessageStatus,
 }
 
@@ -366,6 +431,7 @@ fn extract_history(lazy: &LazyHistorySync) -> Option<History> {
             jid: conversation.id.clone(),
             name: conversation.name.clone().filter(|n| !n.is_empty()),
             unread: conversation.unread_count.unwrap_or(0),
+            archived: conversation.archived.unwrap_or(false),
             messages: Vec::with_capacity(conversation.messages.len()),
         };
         for entry in &conversation.messages {
@@ -375,7 +441,7 @@ fn extract_history(lazy: &LazyHistorySync) -> Option<History> {
             let (Some(key), Some(body)) = (info.key.as_option(), info.message.as_option()) else {
                 continue;
             };
-            let (Some(id), Some((kind, text))) = (key.id.clone(), summarise(body)) else {
+            let (Some(id), Some(summary)) = (key.id.clone(), summarise(body)) else {
                 continue;
             };
             let from_me = key.from_me.unwrap_or(false);
@@ -385,8 +451,7 @@ fn extract_history(lazy: &LazyHistorySync) -> Option<History> {
                 participant: info.participant.clone().or_else(|| key.participant.clone()),
                 push_name: info.push_name.clone(),
                 timestamp: info.message_timestamp.unwrap_or(0) as i64,
-                kind,
-                text,
+                summary,
                 status: history_status(from_me, info.status.map(|s| s.to_i32())),
             });
         }
@@ -477,6 +542,12 @@ async fn on_history(hub: &Hub, client: &Client, lazy: &LazyHistorySync) {
                 if !sender.is_empty() {
                     batch.upsert_contact(sender, None, message.push_name.as_deref())?;
                 }
+                let Summary {
+                    kind,
+                    text,
+                    media,
+                    thumbnail,
+                } = message.summary.clone();
                 batch.insert_message(
                     &NewMessage {
                         chat: chat.jid.clone(),
@@ -484,15 +555,19 @@ async fn on_history(hub: &Hub, client: &Client, lazy: &LazyHistorySync) {
                         sender: sender.clone(),
                         from_me: message.from_me,
                         timestamp: message.timestamp,
-                        kind: message.kind,
-                        text: message.text.clone(),
+                        kind,
+                        text,
                         status: message.status,
+                        media,
+                        thumbnail,
+                        media_path: None,
+                        needs_receipt: false,
                     },
                     false,
                 )?;
             }
-            // The phone's unread count is authoritative for imported chats.
-            batch.set_unread(&chat.jid, chat.unread)?;
+            // The phone is authoritative for imported chats.
+            batch.set_chat_state(&chat.jid, chat.unread, chat.archived)?;
         }
         Ok(())
     });

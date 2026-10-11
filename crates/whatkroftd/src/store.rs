@@ -10,7 +10,7 @@ use std::sync::{Mutex, MutexGuard};
 use rusqlite::{Connection, OptionalExtension, params};
 use whatkroft_ipc::{Chat, Message, MessageKind, MessageStatus};
 
-const SCHEMA_VERSION: i64 = 1;
+use crate::media::MediaRef;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE chats (
@@ -43,6 +43,25 @@ CREATE TABLE messages (
 CREATE INDEX messages_by_chat_time ON messages (chat_jid, timestamp);
 ";
 
+/// Archived chats, attachments, and which messages still owe a read receipt.
+const SCHEMA_V2: &str = "
+ALTER TABLE chats ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE messages ADD COLUMN media TEXT;
+ALTER TABLE messages ADD COLUMN thumbnail BLOB;
+ALTER TABLE messages ADD COLUMN media_path TEXT;
+ALTER TABLE messages ADD COLUMN needs_receipt INTEGER NOT NULL DEFAULT 0;
+
+CREATE INDEX messages_owing_receipt ON messages (chat_jid) WHERE needs_receipt = 1;
+";
+
+/// Migrations in order; a database at `user_version` N has had the first N.
+const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2];
+
+const CHAT_COLUMNS: &str = "c.is_group, c.last_text, c.last_timestamp, c.unread, c.archived";
+const MESSAGE_COLUMNS: &str = "m.from_me, m.timestamp, m.kind, m.text, m.status, \
+                               m.media, m.thumbnail, m.media_path";
+
 /// Display name for a chat or contact: the name we know, else the push name,
 /// else NULL (the caller falls back to the number).
 const NAME_EXPR: &str = "COALESCE(NULLIF(ct.full_name, ''), NULLIF(ct.push_name, ''))";
@@ -62,6 +81,59 @@ pub struct NewMessage {
     pub kind: MessageKind,
     pub text: String,
     pub status: MessageStatus,
+    pub media: Option<MediaRef>,
+    /// Small JPEG preview that came with the message.
+    pub thumbnail: Option<Vec<u8>>,
+    /// The attachment on disk, when we already have it (our own uploads).
+    pub media_path: Option<String>,
+    /// An incoming message the user has not seen yet; a read receipt is sent
+    /// for it when the chat is marked read.
+    pub needs_receipt: bool,
+}
+
+impl NewMessage {
+    pub fn text(
+        chat: &str,
+        id: &str,
+        sender: &str,
+        from_me: bool,
+        timestamp: i64,
+        text: &str,
+    ) -> Self {
+        Self {
+            chat: chat.to_owned(),
+            id: id.to_owned(),
+            sender: sender.to_owned(),
+            from_me,
+            timestamp,
+            kind: MessageKind::Text,
+            text: text.to_owned(),
+            status: if from_me {
+                MessageStatus::Sent
+            } else {
+                MessageStatus::Delivered
+            },
+            media: None,
+            thumbnail: None,
+            media_path: None,
+            needs_receipt: false,
+        }
+    }
+}
+
+/// A message whose read receipt has not been sent yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwedReceipt {
+    pub id: String,
+    pub sender: String,
+}
+
+/// What is needed to fetch a message's attachment.
+#[derive(Debug, Clone)]
+pub struct StoredMedia {
+    pub kind: MessageKind,
+    pub media: MediaRef,
+    pub path: Option<String>,
 }
 
 impl Store {
@@ -78,11 +150,14 @@ impl Store {
 
     fn init(mut conn: Connection) -> rusqlite::Result<Self> {
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version < 1 {
-            let tx = conn.transaction()?;
-            tx.execute_batch(SCHEMA_V1)?;
-            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            tx.commit()?;
+        for (index, migration) in MIGRATIONS.iter().enumerate() {
+            let target = index as i64 + 1;
+            if version < target {
+                let tx = conn.transaction()?;
+                tx.execute_batch(migration)?;
+                tx.pragma_update(None, "user_version", target)?;
+                tx.commit()?;
+            }
         }
         Ok(Self {
             conn: Mutex::new(conn),
@@ -151,11 +226,74 @@ impl Store {
         Ok(changed > 0)
     }
 
+    /// Returns `true` when the flag changed.
+    pub fn set_archived(&self, chat: &str, archived: bool) -> rusqlite::Result<bool> {
+        let changed = self.lock().execute(
+            "UPDATE chats SET archived = ?2 WHERE jid = ?1 AND archived <> ?2",
+            params![chat, archived],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Hand out the messages of `chat` that still owe a read receipt and
+    /// clear the debt, oldest first.
+    pub fn take_owed_receipts(&self, chat: &str) -> rusqlite::Result<Vec<OwedReceipt>> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let owed = {
+            let mut stmt = tx.prepare_cached(
+                "SELECT id, sender_jid FROM messages
+                 WHERE chat_jid = ?1 AND needs_receipt = 1
+                 ORDER BY timestamp, rowid",
+            )?;
+            let rows = stmt.query_map(params![chat], |row| {
+                Ok(OwedReceipt {
+                    id: row.get(0)?,
+                    sender: row.get(1)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if !owed.is_empty() {
+            tx.execute(
+                "UPDATE messages SET needs_receipt = 0 WHERE chat_jid = ?1 AND needs_receipt = 1",
+                params![chat],
+            )?;
+        }
+        tx.commit()?;
+        Ok(owed)
+    }
+
+    pub fn get_media(&self, chat: &str, id: &str) -> rusqlite::Result<Option<StoredMedia>> {
+        let row: Option<(String, Option<String>, Option<String>)> = self
+            .lock()
+            .query_row(
+                "SELECT kind, media, media_path FROM messages WHERE chat_jid = ?1 AND id = ?2",
+                params![chat, id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        Ok(row.and_then(|(kind, media, path)| {
+            Some(StoredMedia {
+                kind: MessageKind::parse(&kind),
+                media: serde_json::from_str(&media?).ok()?,
+                path,
+            })
+        }))
+    }
+
+    pub fn set_media_path(&self, chat: &str, id: &str, path: &str) -> rusqlite::Result<()> {
+        self.lock().execute(
+            "UPDATE messages SET media_path = ?3 WHERE chat_jid = ?1 AND id = ?2",
+            params![chat, id, path],
+        )?;
+        Ok(())
+    }
+
     pub fn list_chats(&self) -> rusqlite::Result<Vec<Chat>> {
         let conn = self.lock();
         let mut stmt = conn.prepare_cached(&format!(
-            "SELECT c.jid, COALESCE(NULLIF(c.name, ''), {NAME_EXPR}), c.is_group,
-                    c.last_text, c.last_timestamp, c.unread
+            "SELECT c.jid, COALESCE(NULLIF(c.name, ''), {NAME_EXPR}), {CHAT_COLUMNS}
              FROM chats c LEFT JOIN contacts ct ON ct.jid = c.jid
              ORDER BY c.last_timestamp DESC, c.jid"
         ))?;
@@ -166,8 +304,7 @@ impl Store {
     pub fn get_chat(&self, jid: &str) -> rusqlite::Result<Option<Chat>> {
         let conn = self.lock();
         let mut stmt = conn.prepare_cached(&format!(
-            "SELECT c.jid, COALESCE(NULLIF(c.name, ''), {NAME_EXPR}), c.is_group,
-                    c.last_text, c.last_timestamp, c.unread
+            "SELECT c.jid, COALESCE(NULLIF(c.name, ''), {NAME_EXPR}), {CHAT_COLUMNS}
              FROM chats c LEFT JOIN contacts ct ON ct.jid = c.jid
              WHERE c.jid = ?1"
         ))?;
@@ -177,8 +314,7 @@ impl Store {
     pub fn get_message(&self, chat: &str, id: &str) -> rusqlite::Result<Option<Message>> {
         let conn = self.lock();
         let mut stmt = conn.prepare_cached(&format!(
-            "SELECT m.chat_jid, m.id, m.sender_jid, {NAME_EXPR}, m.from_me, m.timestamp,
-                    m.kind, m.text, m.status
+            "SELECT m.chat_jid, m.id, m.sender_jid, {NAME_EXPR}, {MESSAGE_COLUMNS}
              FROM messages m LEFT JOIN contacts ct ON ct.jid = m.sender_jid
              WHERE m.chat_jid = ?1 AND m.id = ?2"
         ))?;
@@ -186,27 +322,41 @@ impl Store {
             .optional()
     }
 
-    /// Up to `limit` messages of `chat` older than `before` (Unix seconds),
-    /// returned oldest first.
+    /// Up to `limit` messages of `chat`, oldest first: the newest ones, or
+    /// with `before_id` the ones just before that message.
     pub fn list_messages(
         &self,
         chat: &str,
-        before: Option<i64>,
+        before_id: Option<&str>,
         limit: u32,
     ) -> rusqlite::Result<Vec<Message>> {
         let conn = self.lock();
+        // Position in a chat is (timestamp, rowid): several messages can
+        // share a second, and rowid keeps their arrival order.
+        let cursor: (i64, i64) = match before_id {
+            None => (i64::MAX, i64::MAX),
+            Some(id) => {
+                let found = conn
+                    .query_row(
+                        "SELECT timestamp, rowid FROM messages WHERE chat_jid = ?1 AND id = ?2",
+                        params![chat, id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                match found {
+                    Some(cursor) => cursor,
+                    None => return Ok(Vec::new()),
+                }
+            }
+        };
         let mut stmt = conn.prepare_cached(&format!(
-            "SELECT m.chat_jid, m.id, m.sender_jid, {NAME_EXPR}, m.from_me, m.timestamp,
-                    m.kind, m.text, m.status
+            "SELECT m.chat_jid, m.id, m.sender_jid, {NAME_EXPR}, {MESSAGE_COLUMNS}
              FROM messages m LEFT JOIN contacts ct ON ct.jid = m.sender_jid
-             WHERE m.chat_jid = ?1 AND m.timestamp < ?2
+             WHERE m.chat_jid = ?1 AND (m.timestamp, m.rowid) < (?2, ?3)
              ORDER BY m.timestamp DESC, m.rowid DESC
-             LIMIT ?3"
+             LIMIT ?4"
         ))?;
-        let rows = stmt.query_map(
-            params![chat, before.unwrap_or(i64::MAX), limit],
-            message_from_row,
-        )?;
+        let rows = stmt.query_map(params![chat, cursor.0, cursor.1, limit], message_from_row)?;
         let mut messages = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         messages.reverse();
         Ok(messages)
@@ -250,19 +400,37 @@ impl Batch<'_> {
         Ok(())
     }
 
-    pub fn set_unread(&self, jid: &str, unread: u32) -> rusqlite::Result<()> {
+    /// Apply what the phone says about an imported chat: its unread count,
+    /// with the newest incoming messages owing the matching read receipts,
+    /// and whether it is archived.
+    pub fn set_chat_state(&self, jid: &str, unread: u32, archived: bool) -> rusqlite::Result<()> {
         self.conn.execute(
-            "UPDATE chats SET unread = ?2 WHERE jid = ?1",
+            "UPDATE chats SET unread = ?2, archived = ?3 WHERE jid = ?1",
+            params![jid, unread, archived],
+        )?;
+        self.conn.execute(
+            "UPDATE messages SET needs_receipt = 0 WHERE chat_jid = ?1 AND needs_receipt = 1",
+            params![jid],
+        )?;
+        self.conn.execute(
+            "UPDATE messages SET needs_receipt = 1 WHERE rowid IN (
+                 SELECT rowid FROM messages WHERE chat_jid = ?1 AND from_me = 0
+                 ORDER BY timestamp DESC, rowid DESC LIMIT ?2)",
             params![jid, unread],
         )?;
         Ok(())
     }
 
     pub fn insert_message(&self, msg: &NewMessage, count_unread: bool) -> rusqlite::Result<bool> {
+        let media_json = msg
+            .media
+            .as_ref()
+            .map(|m| serde_json::to_string(m).expect("media reference serialises"));
         let inserted = self.conn.execute(
             "INSERT OR IGNORE INTO messages
-                 (chat_jid, id, sender_jid, from_me, timestamp, kind, text, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (chat_jid, id, sender_jid, from_me, timestamp, kind, text, status,
+                  media, thumbnail, media_path, needs_receipt)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 msg.chat,
                 msg.id,
@@ -272,6 +440,10 @@ impl Batch<'_> {
                 msg.kind.as_str(),
                 msg.text,
                 msg.status.as_i64(),
+                media_json,
+                msg.thumbnail,
+                msg.media_path,
+                msg.needs_receipt && !msg.from_me,
             ],
         )?;
         if inserted == 0 {
@@ -279,6 +451,11 @@ impl Batch<'_> {
         }
         let unread = i64::from(count_unread && !msg.from_me);
         let is_group = msg.chat.ends_with("@g.us");
+        let preview = whatkroft_ipc::preview(
+            msg.kind,
+            &msg.text,
+            msg.media.as_ref().map(|m| m.to_ipc(None, None)).as_ref(),
+        );
         // The preview follows the newest message, which is not always the one
         // just inserted: history arrives out of order.
         self.conn.execute(
@@ -289,7 +466,7 @@ impl Batch<'_> {
                                   THEN excluded.last_text ELSE last_text END,
                  last_timestamp = MAX(last_timestamp, excluded.last_timestamp),
                  unread = unread + excluded.unread",
-            params![msg.chat, is_group, msg.timestamp, msg.text, unread],
+            params![msg.chat, is_group, msg.timestamp, preview, unread],
         )?;
         Ok(true)
     }
@@ -305,6 +482,7 @@ fn chat_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Chat> {
         last_text: row.get(3)?,
         last_timestamp: row.get(4)?,
         unread: row.get(5)?,
+        archived: row.get(6)?,
     })
 }
 
@@ -327,6 +505,14 @@ fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         kind: MessageKind::parse(&kind),
         text: row.get(7)?,
         status: MessageStatus::from_i64(row.get(8)?),
+        media: {
+            let media: Option<String> = row.get(9)?;
+            let thumbnail: Option<Vec<u8>> = row.get(10)?;
+            let path: Option<String> = row.get(11)?;
+            media
+                .and_then(|json| serde_json::from_str::<MediaRef>(&json).ok())
+                .map(|m| m.to_ipc(thumbnail.as_deref(), path))
+        },
     })
 }
 
@@ -349,20 +535,8 @@ mod tests {
     const GROUP: &str = "120363000000000001@g.us";
 
     fn msg(chat: &str, id: &str, ts: i64, from_me: bool, text: &str) -> NewMessage {
-        NewMessage {
-            chat: chat.into(),
-            id: id.into(),
-            sender: if from_me { String::new() } else { ALICE.into() },
-            from_me,
-            timestamp: ts,
-            kind: MessageKind::Text,
-            text: text.into(),
-            status: if from_me {
-                MessageStatus::Sent
-            } else {
-                MessageStatus::Delivered
-            },
-        }
+        let sender = if from_me { "" } else { ALICE };
+        NewMessage::text(chat, id, sender, from_me, ts, text)
     }
 
     #[test]
@@ -441,9 +615,7 @@ mod tests {
         let ids: Vec<_> = page.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["m7", "m8", "m9"]);
 
-        let earlier = store
-            .list_messages(ALICE, Some(page[0].timestamp), 3)
-            .unwrap();
+        let earlier = store.list_messages(ALICE, Some(&page[0].id), 3).unwrap();
         let ids: Vec<_> = earlier.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["m4", "m5", "m6"]);
     }
@@ -553,6 +725,164 @@ mod tests {
             store.list_messages(ALICE, None, 10).unwrap()[0].text,
             "kept"
         );
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn paging_keeps_messages_sharing_a_second() {
+        let store = Store::open_in_memory().unwrap();
+        for i in 0..6 {
+            store
+                .insert_message(&msg(ALICE, &format!("m{i}"), 100, false, "x"), false)
+                .unwrap();
+        }
+        let newest = store.list_messages(ALICE, None, 2).unwrap();
+        let middle = store.list_messages(ALICE, Some(&newest[0].id), 2).unwrap();
+        let oldest = store.list_messages(ALICE, Some(&middle[0].id), 2).unwrap();
+        let ids: Vec<_> = [oldest, middle, newest]
+            .concat()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, ["m0", "m1", "m2", "m3", "m4", "m5"]);
+        assert!(
+            store
+                .list_messages(ALICE, Some("m0"), 2)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_messages(ALICE, Some("nope"), 2)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn archive_flag() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .insert_message(&msg(ALICE, "1", 100, false, "a"), false)
+            .unwrap();
+        assert!(!store.get_chat(ALICE).unwrap().unwrap().archived);
+        assert!(store.set_archived(ALICE, true).unwrap());
+        assert!(!store.set_archived(ALICE, true).unwrap(), "no change");
+        assert!(store.list_chats().unwrap()[0].archived);
+        // A new message does not pull the chat out of the archive.
+        store
+            .insert_message(&msg(ALICE, "2", 101, false, "b"), true)
+            .unwrap();
+        assert!(store.get_chat(ALICE).unwrap().unwrap().archived);
+        assert!(store.set_archived(ALICE, false).unwrap());
+    }
+
+    #[test]
+    fn owed_receipts_are_handed_out_once() {
+        let store = Store::open_in_memory().unwrap();
+        let mut live = msg(ALICE, "live", 100, false, "a");
+        live.needs_receipt = true;
+        let mut mine = msg(ALICE, "mine", 101, true, "b");
+        mine.needs_receipt = true;
+        store.insert_message(&live, true).unwrap();
+        store.insert_message(&mine, true).unwrap();
+        store
+            .insert_message(&msg(ALICE, "old", 50, false, "c"), false)
+            .unwrap();
+
+        let owed = store.take_owed_receipts(ALICE).unwrap();
+        assert_eq!(
+            owed,
+            [OwedReceipt {
+                id: "live".into(),
+                sender: ALICE.into()
+            }],
+            "only unseen incoming messages owe a receipt"
+        );
+        assert!(store.take_owed_receipts(ALICE).unwrap().is_empty());
+    }
+
+    #[test]
+    fn imported_chat_state() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .batch(|b| {
+                for i in 0..4 {
+                    b.insert_message(&msg(ALICE, &format!("m{i}"), 100 + i, false, "x"), false)?;
+                }
+                b.insert_message(&msg(ALICE, "mine", 200, true, "y"), false)?;
+                b.set_chat_state(ALICE, 2, true)
+            })
+            .unwrap();
+        let chat = store.get_chat(ALICE).unwrap().unwrap();
+        assert_eq!((chat.unread, chat.archived), (2, true));
+        let owed: Vec<_> = store
+            .take_owed_receipts(ALICE)
+            .unwrap()
+            .into_iter()
+            .map(|o| o.id)
+            .collect();
+        assert_eq!(owed, ["m2", "m3"], "the newest incoming messages");
+    }
+
+    #[test]
+    fn media_is_stored_and_previewed() {
+        let store = Store::open_in_memory().unwrap();
+        let mut photo = msg(ALICE, "p", 100, false, "sunset");
+        photo.kind = MessageKind::Image;
+        photo.media = Some(MediaRef {
+            direct_path: Some("/v/t62/abc".into()),
+            media_key: Some(vec![1, 2, 3]),
+            mime: Some("image/jpeg".into()),
+            width: Some(800),
+            height: Some(600),
+            ..MediaRef::default()
+        });
+        photo.thumbnail = Some(vec![0xff, 0xd8, 0xff]);
+        store.insert_message(&photo, true).unwrap();
+
+        assert_eq!(
+            store.get_chat(ALICE).unwrap().unwrap().last_text.as_deref(),
+            Some("Photo: sunset")
+        );
+        let got = store.get_message(ALICE, "p").unwrap().unwrap();
+        assert_eq!(got.text, "sunset");
+        let media = got.media.unwrap();
+        assert_eq!(media.width, Some(800));
+        assert_eq!(media.thumbnail.as_deref(), Some("/9j/"));
+        assert_eq!(media.path, None);
+
+        let stored = store.get_media(ALICE, "p").unwrap().unwrap();
+        assert_eq!(stored.kind, MessageKind::Image);
+        assert_eq!(stored.media.media_key.as_deref(), Some(&[1u8, 2, 3][..]));
+
+        store.set_media_path(ALICE, "p", "/data/p.jpg").unwrap();
+        let got = store.get_message(ALICE, "p").unwrap().unwrap();
+        assert_eq!(got.media.unwrap().path.as_deref(), Some("/data/p.jpg"));
+        assert!(store.get_media(ALICE, "1").unwrap().is_none());
+    }
+
+    #[test]
+    fn version_1_database_is_upgraded() {
+        let dir = std::env::temp_dir().join(format!("whatkroft-mig-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+            conn.execute_batch(
+                "INSERT INTO chats (jid, last_timestamp, last_text) VALUES ('a@s.whatsapp.net', 5, 'old');
+                 INSERT INTO messages VALUES ('a@s.whatsapp.net', 'x', 'a@s.whatsapp.net', 0, 5, 'text', 'old', 2);",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let chat = store.get_chat("a@s.whatsapp.net").unwrap().unwrap();
+        assert!(!chat.archived);
+        let message = &store.list_messages("a@s.whatsapp.net", None, 5).unwrap()[0];
+        assert_eq!((message.text.as_str(), &message.media), ("old", &None));
         drop(store);
         std::fs::remove_dir_all(&dir).unwrap();
     }

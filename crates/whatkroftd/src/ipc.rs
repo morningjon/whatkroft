@@ -11,6 +11,7 @@ use whatkroft_ipc::{
 
 use crate::demo;
 use crate::hub::Hub;
+use crate::media;
 use crate::wa;
 
 /// Largest page a client may ask for in one `list_messages`.
@@ -137,18 +138,86 @@ async fn dispatch(daemon: &Daemon, request: Request) -> Result<Reply, String> {
         Request::ListChats => hub.store.list_chats().map(Reply::Chats).map_err(db),
         Request::ListMessages {
             chat,
-            before,
+            before_id,
             limit,
         } => {
             let messages = hub
                 .store
-                .list_messages(&chat, before, limit.clamp(1, MAX_PAGE))
+                .list_messages(&chat, before_id.as_deref(), limit.clamp(1, MAX_PAGE))
                 .map_err(db)?;
-            Ok(Reply::Messages { chat, messages })
+            Ok(Reply::Messages {
+                chat,
+                before_id,
+                messages,
+            })
         }
         Request::MarkRead { chat } => {
             if hub.store.mark_read(&chat).map_err(db)? {
                 hub.emit_chat(&chat);
+            }
+            match &daemon.backend {
+                Backend::WhatsApp(slot) => {
+                    // Receipts are best effort and must not hold up the reply.
+                    if let Some(client) = slot.get() {
+                        let hub = Arc::clone(hub);
+                        tokio::spawn(async move {
+                            wa::send_read_receipts(&hub, &client, &chat).await;
+                        });
+                    }
+                }
+                Backend::Demo => {
+                    let _ = hub.store.take_owed_receipts(&chat);
+                }
+            }
+            Ok(Reply::Done)
+        }
+        Request::SetArchived { chat, archived } => {
+            match &daemon.backend {
+                Backend::WhatsApp(slot) => {
+                    let client = slot.get().ok_or("WhatsApp client is not running")?;
+                    wa::set_archived(hub, &client, &chat, archived).await?;
+                }
+                Backend::Demo => hub.set_archived(&chat, archived),
+            }
+            Ok(Reply::Done)
+        }
+        Request::SendFile {
+            chat,
+            path,
+            caption,
+        } => {
+            let sent = match &daemon.backend {
+                Backend::WhatsApp(slot) => {
+                    let client = slot.get().ok_or("WhatsApp client is not running")?;
+                    media::send_file(hub, &client, &chat, &path, caption.as_deref()).await?
+                }
+                Backend::Demo => demo::send_file(hub, &chat, &path, caption.as_deref()).await?,
+            };
+            Ok(Reply::Sent(Box::new(sent)))
+        }
+        Request::DownloadMedia { chat, id } => {
+            let client = match &daemon.backend {
+                Backend::WhatsApp(slot) => {
+                    Some(slot.get().ok_or("WhatsApp client is not running")?)
+                }
+                Backend::Demo => None,
+            };
+            if hub.begin_download(&chat, &id) {
+                let hub = Arc::clone(hub);
+                tokio::spawn(async move {
+                    let result = {
+                        let _slot = hub.download_slots.acquire().await;
+                        match &client {
+                            Some(client) => media::download(&hub, client, &chat, &id).await,
+                            None => demo::download(&hub, &chat, &id).await,
+                        }
+                    };
+                    hub.end_download(&chat, &id);
+                    hub.emit(match result {
+                        Ok(path) => Event::Media { chat, id, path },
+                        Err(error) => Event::MediaFailed { chat, id, error },
+                    });
+                });
             }
             Ok(Reply::Done)
         }
@@ -163,7 +232,7 @@ async fn dispatch(daemon: &Daemon, request: Request) -> Result<Reply, String> {
                 }
                 Backend::Demo => demo::send_text(hub, &chat, &text)?,
             };
-            Ok(Reply::Sent(sent))
+            Ok(Reply::Sent(Box::new(sent)))
         }
         Request::Logout => {
             match &daemon.backend {
