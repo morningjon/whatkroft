@@ -35,7 +35,7 @@
 }
 
 .bubble.out {
-  background-color: mix(@window_bg_color, @accent_bg_color, 0.35);
+  background-color: @wk_bubble_out;
 }
 
 .bubble .sender {
@@ -54,7 +54,7 @@
 }
 
 .bubble .meta.read {
-  color: @accent_color;
+  color: @wk_read;
   opacity: 1;
 }
 

@@ -20,16 +20,75 @@ const LOAD_OLDER_WITHIN: f64 = 400.0;
 /// How close to the end (in pixels) still counts as "reading the latest".
 const BOTTOM_SLACK: f64 = 48.0;
 
-pub fn load_css() {
-    let provider = gtk::CssProvider::new();
-    provider.load_from_string(include_str!("style.css"));
-    if let Some(display) = gtk::gdk::Display::default() {
-        gtk::style_context_add_provider_for_display(
-            &display,
-            &provider,
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
+/// WhatKroft's own colours, replacing the desktop accent so the app looks
+/// the same everywhere: green for sent bubbles, buttons, badges and
+/// highlights. Read ticks stay blue, as WhatsApp users expect.
+struct Palette {
+    /// Fill of buttons, badges and selections; white text sits on it.
+    accent_bg: &'static str,
+    /// Accent used as text on the window background (sender names, links).
+    accent: &'static str,
+    bubble_out: &'static str,
+    read: &'static str,
+}
+
+const LIGHT: Palette = Palette {
+    accent_bg: "#17834a",
+    accent: "#0f7a3d",
+    bubble_out: "#d9fdd3",
+    read: "#027eb5",
+};
+
+const DARK: Palette = Palette {
+    accent_bg: "#1d9a58",
+    accent: "#5fd38d",
+    bubble_out: "#005c4b",
+    read: "#53bdeb",
+};
+
+fn stylesheet(dark: bool) -> String {
+    let p = if dark { &DARK } else { &LIGHT };
+    let mut css = format!(
+        "@define-color accent_bg_color {bg};\n\
+         @define-color accent_color {accent};\n\
+         @define-color accent_fg_color #ffffff;\n\
+         @define-color wk_bubble_out {bubble};\n\
+         @define-color wk_read {read};\n",
+        bg = p.accent_bg,
+        accent = p.accent,
+        bubble = p.bubble_out,
+        read = p.read,
+    );
+    // Newer libadwaita reads its accent from CSS variables instead. Older
+    // GTK does not know the syntax and would warn about it.
+    if gtk::major_version() > 4 || gtk::minor_version() >= 16 {
+        css.push_str(&format!(
+            ":root {{ --accent-bg-color: {bg}; --accent-color: {accent}; \
+             --accent-fg-color: #ffffff; }}\n",
+            bg = p.accent_bg,
+            accent = p.accent,
+        ));
     }
+    css.push_str(include_str!("style.css"));
+    css
+}
+
+/// Install the stylesheet and keep it matched to light or dark mode.
+pub fn load_css() {
+    let Some(display) = gdk::Display::default() else {
+        return;
+    };
+    let provider = gtk::CssProvider::new();
+    let style = adw::StyleManager::default();
+    provider.load_from_string(&stylesheet(style.is_dark()));
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+    style.connect_dark_notify(move |style| {
+        provider.load_from_string(&stylesheet(style.is_dark()));
+    });
 }
 
 pub struct App {

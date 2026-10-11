@@ -2694,7 +2694,7 @@ dependencies = [
 
 [[package]]
 name = "whatkroft"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-channel",
  "base64 0.22.1",
@@ -2709,7 +2709,7 @@ dependencies = [
 
 [[package]]
 name = "whatkroft-ipc"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2717,7 +2717,7 @@ dependencies = [
 
 [[package]]
 name = "whatkroftd"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
