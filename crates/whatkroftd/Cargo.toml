@@ -1,0 +1,20 @@
+[package]
+name = "whatkroftd"
+description = "WhatKroft background daemon: WhatsApp connection, local store and IPC"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+whatkroft-ipc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+env_logger.workspace = true
+# Default features minus `simd`, which needs a nightly compiler.
+whatsapp-rust = { version = "0.7", default-features = false, features = ["sqlite-storage", "tokio-runtime", "tokio-native", "tokio-transport", "ureq-client"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "io-util", "sync", "time"] }
+anyhow = "1"
+rusqlite = { version = "0.39", features = ["bundled"] }

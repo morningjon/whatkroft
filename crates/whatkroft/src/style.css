@@ -1,0 +1,73 @@
+.qr {
+  border-radius: 12px;
+}
+
+.chat-row {
+  padding: 8px 6px;
+}
+
+.chat-row .name {
+  font-weight: 600;
+}
+
+.badge {
+  background-color: @accent_bg_color;
+  color: @accent_fg_color;
+  border-radius: 999px;
+  padding: 1px 7px;
+  min-width: 8px;
+  font-size: 0.8em;
+  font-weight: 700;
+}
+
+.messages {
+  padding: 12px 0;
+}
+
+.bubble {
+  padding: 7px 11px 5px 11px;
+  border-radius: 14px;
+  margin: 2px 12px;
+}
+
+.bubble.in {
+  background-color: mix(@window_bg_color, @window_fg_color, 0.1);
+}
+
+.bubble.out {
+  background-color: mix(@window_bg_color, @accent_bg_color, 0.35);
+}
+
+.bubble .sender {
+  color: @accent_color;
+  font-weight: 600;
+  font-size: 0.9em;
+}
+
+.bubble .media {
+  font-style: italic;
+}
+
+.bubble .meta {
+  font-size: 0.75em;
+  opacity: 0.65;
+}
+
+.bubble .meta.read {
+  color: @accent_color;
+  opacity: 1;
+}
+
+.day {
+  margin: 10px 0 6px 0;
+  padding: 2px 12px;
+  border-radius: 999px;
+  background-color: mix(@window_bg_color, @window_fg_color, 0.07);
+  font-size: 0.8em;
+  font-weight: 600;
+  opacity: 0.8;
+}
+
+.composer {
+  padding: 8px 12px;
+}

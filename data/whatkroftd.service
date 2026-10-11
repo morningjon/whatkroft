@@ -1,0 +1,19 @@
+# Optional: keep the daemon running in the background so messages arrive
+# without the window open.
+#
+#   install -Dm644 data/whatkroftd.service ~/.config/systemd/user/whatkroftd.service
+#   systemctl --user enable --now whatkroftd
+#
+# Without this unit the window starts the daemon itself on first launch.
+[Unit]
+Description=WhatKroft background daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/.cargo/bin/whatkroftd
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

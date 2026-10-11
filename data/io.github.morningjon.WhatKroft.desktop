@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=WhatKroft
+GenericName=WhatsApp Client
+Comment=Native WhatsApp client (unofficial)
+Exec=whatkroft
+Icon=io.github.morningjon.WhatKroft
+Terminal=false
+Categories=Network;InstantMessaging;GTK;
+Keywords=whatsapp;chat;messaging;
+StartupNotify=true
+DBusActivatable=false
