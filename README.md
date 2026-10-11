@@ -65,6 +65,20 @@ Not yet:
 The window starts the daemon if it is not already running. The daemon keeps
 running after the window closes, so the session stays connected.
 
+## Download
+
+Each [release](https://github.com/morningjon/whatkroft/releases) has an
+AppImage for x86-64 that bundles the window, the daemon, GTK4 and libadwaita:
+
+```sh
+chmod +x WhatKroft-*-x86_64.AppImage
+./WhatKroft-*-x86_64.AppImage
+```
+
+It needs glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, current Arch and
+CachyOS). It runs through XWayland on Wayland sessions; set
+`WHATKROFT_GDK_BACKEND=wayland` to try native Wayland instead.
+
 ## Building
 
 You need Rust 1.94 or newer, GTK 4.12 or newer and libadwaita 1.4 or newer.
@@ -101,6 +115,12 @@ To install both binaries into `~/.cargo/bin`:
 ```sh
 cargo install --path crates/whatkroftd
 cargo install --path crates/whatkroft
+```
+
+To build the AppImage yourself (also needs `patchelf`, `librsvg` and `curl`):
+
+```sh
+packaging/appimage/build.sh
 ```
 
 `data/` has a desktop entry and an optional systemd user unit for running the
