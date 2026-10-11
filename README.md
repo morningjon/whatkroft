@@ -6,7 +6,7 @@ deleted once releases carry the downloads.
 
 | File | Built from |
 | --- | --- |
-| `WhatKroft-0.2.0-x86_64.AppImage` | `archive-and-media` at a48cdee (pull request 2), on Ubuntu 24.04 (needs glibc 2.39 or newer) |
+| `WhatKroft-0.2.1-x86_64.AppImage` | `main` at dcbdaf2, on Ubuntu 24.04 (needs glibc 2.39 or newer) |
 
 Unofficial client, not affiliated with WhatsApp or Meta. Early alpha: not yet
 tested against a live WhatsApp account.
